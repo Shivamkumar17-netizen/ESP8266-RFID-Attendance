@@ -1,0 +1,326 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LittleFS.h>
+
+// खुद का वाईफाई नेटवर्क (Access Point) का नाम और पासवर्ड
+const char* ap_ssid = "Attendance_System_WiFi";
+const char* ap_password = "password"; 
+
+// एडमिन पैनल का पासवर्ड
+const char* adminPassword = "admin123"; 
+
+// फिक्स IP एड्रेस कॉन्फ़िगरेशन
+IPAddress local_IP(11, 11, 11, 11);
+IPAddress gateway(11, 11, 11, 11);
+IPAddress subnet(255, 255, 255, 0);
+
+// आपके कनेक्शन के अनुसार RFID पिंस की सेटिंग
+#define SS_PIN          D4   // RFID का SDA पिन नोडम्यूच्यू के D4 पर
+#define RST_PIN         D3   // RFID का RST पिन नोडम्यूच्यू के D3 पर
+#define LED_PIN         D1   // आपकी LED नोडम्यूच्यू के D1 पर
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+ESP8266WebServer server(80);
+
+String lastScannedUID = ""; 
+bool isAdminAuthenticated = false; 
+String loginMessage = "";
+
+// लाइव काउंटर्स
+int totalPresentCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // SPI और RFID को शुरू करना
+  SPI.begin();           
+  mfrc522.PCD_Init();    
+  
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // एक्सेस पॉइंट (खुद का वाईफाई) सेट करना
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(ap_ssid, ap_password);
+
+  Serial.println("WiFi Access Point Ready!");
+  Serial.print("IP Address: "); Serial.println(WiFi.softAPIP());
+
+  if(!LittleFS.begin()){
+    Serial.println("An Error has occurred while mounting LittleFS");
+    return;
+  }
+
+  // अगर अटेंडेंस लॉग फाइल पहले से नहीं है, तो हेडर के साथ बनाएं
+  if (!LittleFS.exists("/attendance_records.csv")) {
+    File file = LittleFS.open("/attendance_records.csv", "w");
+    file.println("Card UID,User Name,Status,Network Mode");
+    file.close();
+  }
+
+  initWebServer();
+}
+
+// चेक करना कि क्या कार्ड रजिस्टर्ड है
+bool isCardRegistered(String uid) {
+  return LittleFS.exists("/" + uid + ".txt");
+}
+
+// कार्ड का नाम रीड करना
+String getCardName(String uid) {
+  if (LittleFS.exists("/" + uid + ".txt")) {
+    File file = LittleFS.open("/" + uid + ".txt", "r");
+    String name = file.readString();
+    file.close();
+    return name;
+  }
+  return "Unknown Card (" + uid + ")";
+}
+
+// कार्ड की वर्तमान इन/आउट स्थिति जाँचना और उसे बदलना
+String getAndToggleStatus(String uid) {
+  String statusPath = "/" + uid + "_status.txt";
+  String currentStatus = "IN";
+  
+  if (LittleFS.exists(statusPath)) {
+    File file = LittleFS.open(statusPath, "r");
+    currentStatus = file.readString();
+    file.close();
+    
+    // स्थिति को उल्टा करें (Toggle Logics)
+    if (currentStatus == "IN") {
+      currentStatus = "OUT";
+      if(totalPresentCount > 0) totalPresentCount--;
+    } else {
+      currentStatus = "IN";
+      totalPresentCount++;
+    }
+  } else {
+    // पहली बार स्कैन होने पर डिफ़ॉल्ट रूप से IN
+    totalPresentCount++;
+  }
+  
+  // नई स्थिति को वापस फाइल में सेव करें
+  File file = LittleFS.open(statusPath, "w");
+  file.print(currentStatus);
+  file.close();
+  
+  return currentStatus;
+}
+
+void blinkLED() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(200);
+    digitalWrite(LED_PIN, LOW);  delay(200);
+  }
+}
+
+void loop() {
+  server.handleClient();
+
+  if ( ! mfrc522.PICC_IsNewCardPresent() || ! mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  String scannedUID = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+     scannedUID += String(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " ");
+     scannedUID += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  scannedUID.trim(); scannedUID.toUpperCase();
+  
+  lastScannedUID = scannedUID; 
+  
+  bool registered = isCardRegistered(scannedUID);
+  String cardName = getCardName(scannedUID);
+  String ioStatus = getAndToggleStatus(scannedUID);
+
+  // CSV फाइल में अटेंडेंस रिकॉर्ड्स सेव करना
+  File file = LittleFS.open("/attendance_records.csv", "a");
+  if (file) {
+    file.println(scannedUID + "," + cardName + "," + ioStatus + ",Offline Local Mode");
+    file.close();
+  }
+
+  // LED एक्शन लॉजिक (रजिस्टर्ड होने पर 2 सेकंड ऑन, नहीं तो 3 बार ब्लिंक)
+  if (registered) {
+    digitalWrite(LED_PIN, HIGH); delay(2000); digitalWrite(LED_PIN, LOW);
+  } else {
+    blinkLED();
+  }
+
+  mfrc522.PICC_HaltA();
+}
+
+// ---- डैशबोर्ड HTML ----
+void handleRoot() {
+  // 💡 यहाँ UTF-8 मेटा टैग जोड़ा गया है ताकि कैरेक्टर एनकोडिंग परफेक्ट रहे
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Smart Attendance Dashboard</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; background-color: #f4f4f9; margin:0; padding:20px; text-align:center;}";
+  html += ".box { max-width: 700px; margin: 20px auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0px 4px 10px rgba(0,0,0,0.1); }";
+  html += "table { width: 100%; border-collapse: collapse; margin-top: 15px; }";
+  html += "th, td { padding: 10px; border: 1px solid #ddd; text-align: center; }";
+  html += "th { background-color: #4CAF50; color: white; }";
+  html += "input[type=text], input[type=password] { padding: 8px; width: 60%; margin: 10px; border: 1px solid #ccc; border-radius: 4px; }";
+  html += ".btn-save { background-color: #008CBA; color: white; padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; }";
+  html += ".btn-del { background-color: #f44336; color: white; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; }";
+  html += ".btn-csv { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin: 10px; display: inline-block; text-decoration: none; }";
+  html += ".status-bar { background: #e2e2e2; padding: 10px; border-radius: 5px; font-weight: bold; color: #333; display: flex; justify-content: space-around; }";
+  html += ".counter-box { font-size: 18px; color: #4CAF50; font-weight: bold; }";
+  html += "</style>";
+  
+  // AJAX स्क्रिप्ट
+  html += "<script>";
+  html += "setInterval(function() {";
+  html += "  var xhttp = new XMLHttpRequest();";
+  html += "  xhttp.onreadystatechange = function() {";
+  html += "    if (this.readyState == 4 && this.status == 200) {";
+  html += "      var parser = new DOMParser();";
+  html += "      var doc = parser.parseFromString(this.responseText, 'text/html');";
+  html += "      document.getElementById('attendance-table').innerHTML = doc.getElementById('attendance-table').innerHTML;";
+  html += "      document.getElementById('live-counter').innerHTML = doc.getElementById('live-counter').innerHTML;";
+  html += "    }";
+  html += "  };";
+  html += "  xhttp.open('GET', '/', true);";
+  html += "  xhttp.send();";
+  html += "}, 2000);"; 
+  html += "</script>";
+  
+  html += "</head><body>";
+  
+  html += "<div class='box'>";
+  html += "<h2>Smart Attendance Dashboard</h2>"; 
+  html += "<div class='status-bar'>";
+  html += "<span>Active WiFi Network: <span style='color:#008CBA;'>" + String(ap_ssid) + "</span></span>";
+  html += "<span id='live-counter' class='counter-box'>Present Inside: " + String(totalPresentCount) + "</span>";
+  html += "</div>";
+  html += "</div>";
+
+  // एडमिन पैनल
+  html += "<div class='box'>";
+  if (!isAdminAuthenticated) {
+    html += "<h3>🔒 Admin Authentication</h3>"; 
+    if(loginMessage != "") html += "<p style='color:red;'>" + loginMessage + "</p>";
+    html += "<form action='/login' method='POST'>";
+    html += "<input type='password' name='pwd' placeholder='Enter Admin Password' required><br>";
+    html += "<input type='submit' class='btn-save' value='Access Panel'>"; 
+    html += "</form>";
+  } else {
+    html += "<h3>🔓 Control Panel (Authorized Access)</h3>"; 
+    html += "<form action='/save' method='POST'>";
+    html += "Detected Card UID: <input type='text' name='uid' value='" + lastScannedUID + "' readonly><br>"; 
+    html += "Assign User Name: <input type='text' name='name' placeholder='Enter Name to Register' required><br>"; 
+    html += "<input type='submit' class='btn-save' value='Save / Update Card'> ";
+    html += "<a href='/logout' style='text-decoration:none;'><button type='button' class='btn-del'>Lock Panel</button></a>"; 
+    html += "</form>";
+  }
+  html += "</div>";
+
+  // लाइव लॉग टेबल
+  html += "<div class='box'>";
+  html += "<h3>Live Attendance Activity</h3>"; 
+  html += "<a href='/download' class='btn-csv'>📥 Download Excel (CSV) Report</a>"; 
+  html += "<div id='attendance-table'>";
+  html += "<table><tr><th>User / Card Identity</th><th>Attendance Status</th><th>Network Log</th></tr>";
+  
+  File file = LittleFS.open("/attendance_records.csv", "r");
+  if (file) {
+    file.readStringUntil('\n'); // हेडर स्किप करें
+    String lines = "";
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      if (line.length() > 5) {
+        int firstComma = line.indexOf(',');
+        int secondComma = line.indexOf(',', firstComma + 1);
+        int thirdComma = line.indexOf(',', secondComma + 1);
+        
+        String uid = line.substring(0, firstComma);
+        String name = line.substring(firstComma + 1, secondComma);
+        String stat = line.substring(secondComma + 1, thirdComma);
+        String net = line.substring(thirdComma + 1);
+        
+        lines = "<tr><td>" + name + "</td><td>" + stat + "</td><td>" + net + "</td></tr>" + lines;
+      }
+    }
+    file.close();
+    html += lines;
+  }
+  
+  html += "</table>";
+  html += "</div>";
+  html += "<br><a href='/clear'><button class='btn-del'>Clear All Records</button></a>"; 
+  html += "</div>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleDownload() {
+  File file = LittleFS.open("/attendance_records.csv", "r");
+  if (!file) {
+    server.send(500, "text/plain", "File Not Found");
+    return;
+  }
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+
+void handleLogin() {
+  String inputPwd = server.arg("pwd");
+  if (inputPwd == adminPassword) {
+    isAdminAuthenticated = true;
+    loginMessage = "";
+  } else {
+    isAdminAuthenticated = false;
+    loginMessage = "Invalid Password! Access Denied."; 
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleLogout() {
+  isAdminAuthenticated = false;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSave() {
+  if (!isAdminAuthenticated) {
+    server.send(403, "text/plain", "Unauthorized");
+    return;
+  }
+  String uid = server.arg("uid");
+  String nameArg = server.arg("name");
+  if(uid != "") {
+    File file = LittleFS.open("/" + uid + ".txt", "w");
+    file.print(nameArg);
+    file.close();
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleClear() {
+  File file = LittleFS.open("/attendance_records.csv", "w");
+  file.println("Card UID,User Name,Status,Network Mode");
+  file.close();
+  
+  totalPresentCount = 0;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void initWebServer() {
+  server.on("/", handleRoot);
+  server.on("/login", handleLogin);
+  server.on("/logout", handleLogout);
+  server.on("/save", handleSave);
+  server.on("/clear", handleClear);
+  server.on("/download", handleDownload); 
+  server.begin();
+}
